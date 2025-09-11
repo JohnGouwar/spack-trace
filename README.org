@@ -1,0 +1,55 @@
+#+TITLE: spack-trace: Generate compile_commands.json for your dev-specs
+#+AUTHOR: John Gouwar
+* System requirements
+- ~glibc>=2.3.4~ / ~linux-kernel>=2.6.6~
+- ~python>=3.10~
+- ~spack>=1.0.1~ run with appropriate setup script (_e.g._, ~. spack/share/spack/setup-env.sh~)
+- GNU ~make~
+* Installing the extension
+This extension relies on a small C library to extend Python, running ~make
+install~ builds the C extension and adds this as a Spack extension module to your
+spack config (_e.g._, ~.config/spack/config.yaml~)
+* Using the extension
+** Running the extension
+This extension will trace all C/C++ compilation commands for the develop specs in an
+active environment simply by running ~spack trace~ with the environment active.
+** Command-line options
+#+begin_example
+$ spack trace --help
+usage: spack trace [-h] [-j JOBS] [-p CONCURRENT_PACKAGES] [-f] [-U] [--reuse]
+                   [--fresh-roots] [--deprecated] [--cache-dir CACHE_DIR] [--no-cache]
+                   ...
+
+Generate a compile_commands.json for all develop specs in an environment
+
+positional arguments:
+  specs                 one or more package specs
+
+options:
+  --cache-dir CACHE_DIR
+                        Where to store cached_output for this extension (defaults to .trace-cache)
+                        Not needed in active environment
+  --no-cache            Do not cache anything related to this extension
+  -h, --help            show this help message and exit
+  -j, --jobs JOBS       explicitly set number of parallel jobs
+  -p, --concurrent-packages CONCURRENT_PACKAGES
+                        maximum number of packages to build concurrently
+
+concretizer arguments:
+  --deprecated          allow concretizer to select deprecated versions
+  --fresh-roots, --reuse-deps
+                        concretize with fresh roots and reused dependencies
+  --reuse               reuse installed packages/buildcaches when possible
+  -U, --fresh           do not reuse installed deps; build newest configuration
+  -f, --force           allow changes to concretized specs in spack.lock (in an env)
+#+end_example
+** Example workflow
+To trace the compilation of ~zlib~ and ~mpich~, you would run the following commands
+#+begin_example
+$ spack env activate --create my-env
+$ spack add zlib mpich
+$ spack develop zlib mpich
+$ spack trace
+Logged commands for zlib to SPACK_ROOT/var/spack/environments/my-env/zlib/compile_commands.json
+Logged commands for mpich to SPACK_ROOT/var/spack/environments/my-env/mpich/compile_commands.json
+#+end_example
