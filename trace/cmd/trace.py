@@ -48,19 +48,14 @@ def _installer_proc(env: spack.environment.Environment):
     Run the installer for an environment and then notify the listener on exit,
     Note: should be run as a subprocess from `trace_compiler_calls`
     '''
-    with SuppressOutput(
-            msg_enabled=False,
-            warn_enabled=False,
-            error_enabled=False
-    ):
-        try:
-            env.install_all()
-        except Exception as e:
-            print(e)
-        finally:
-            mq = PosixMQ.open(COMPILE_COMMANDS_MQ)
-            mq.send(DONE_MSG, DONE_MSG_PRIO)
-            mq.close()
+    try:
+        env.install_all()
+    except Exception as e:
+        print(e)
+    finally:
+        mq = PosixMQ.open(COMPILE_COMMANDS_MQ)
+        mq.send(DONE_MSG, DONE_MSG_PRIO)
+        mq.close()
 
             
 
