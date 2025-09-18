@@ -1,4 +1,3 @@
-from typing import Self
 from ctypes import CDLL, POINTER, c_char_p, c_int, c_size_t, c_uint, byref, create_string_buffer
 from pathlib import Path
 
@@ -37,7 +36,7 @@ class PosixMQ:
             name: str,
             max_queue_size: int = 10,
             max_msg_size = 4096
-    ) -> Self:
+    ) -> "PosixMQ":
         queue_id = c_int()
         res = posixmq_open_create(
             name.encode(),
@@ -51,7 +50,7 @@ class PosixMQ:
 
     
     @classmethod
-    def open(cls, name: str) -> Self:
+    def open(cls, name: str) -> "PosixMQ":
         queue_id = c_int()
         max_queue_size = c_size_t()
         max_msg_size = c_size_t()
