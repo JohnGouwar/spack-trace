@@ -1,10 +1,9 @@
 from collections import defaultdict
-import sys
-import os
 import json
 import spack.cmd.uninstall
 from spack.error import SpackError
 from argparse import ArgumentParser
+from spack.installer import PackageInstaller
 from spack.spec import Spec
 from pathlib import Path
 import spack.config
@@ -17,7 +16,7 @@ from spack.cmd.common import arguments
 from spack.cmd import parse_specs
 from multiprocessing import Process
 import select
-from spack.llnl.util.tty import SuppressOutput, msg_enabled
+from spack.llnl.util.tty import SuppressOutput
 from typing import List, Dict, TypedDict, Optional
 try:
     from spack.extensions.trace.PosixMQ import PosixMQ
@@ -43,7 +42,7 @@ class CompileCommand(TypedDict):
     output: Optional[str]
 
 
-def _installer_proc(env: spack.environment.Environment):
+def _env_installer_proc(env: spack.environment.Environment):
     '''
     Run the installer for an environment and then notify the listener on exit,
     Note: should be run as a subprocess from `trace_compiler_calls`
@@ -57,9 +56,26 @@ def _installer_proc(env: spack.environment.Environment):
         mq.send(DONE_MSG, DONE_MSG_PRIO)
         mq.close()
 
+def _single_installer_proc(package: spack.package_base.PackageBase):
+    '''
+    Run the installer for a single spec and then notify the listener on exit,
+    Note: should be run as a subprocess from `trace_compiler_calls`
+    '''
+    try:
+        PackageInstaller([package], keep_stage=True, restage=True).install()
+    except Exception as e:
+        print(e)
+    finally:
+        mq = PosixMQ.open(COMPILE_COMMANDS_MQ)
+        mq.send(DONE_MSG, DONE_MSG_PRIO)
+        mq.close()
             
 
-def trace_compiler_calls(env: spack.environment.Environment) -> List[str]:
+def trace_compiler_calls(
+    *,
+    package: Optional[spack.package_base.PackageBase]=None,
+    env: Optional[spack.environment.Environment]=None
+    ) -> List[str]:
     '''
     This function does three things:
     1. Fork the appropriate installer
@@ -70,9 +86,16 @@ def trace_compiler_calls(env: spack.environment.Environment) -> List[str]:
     mq = PosixMQ.create(COMPILE_COMMANDS_MQ)
     try:
         # Fork installation process,
-        Process(
-            target=_installer_proc, args=(env,)
-        ).start()
+        if env:
+            Process(
+                target=_env_installer_proc, args=(env,)
+            ).start()
+        elif package:
+            Process(
+                target=_single_installer_proc, args=(package,)
+            ).start()
+        else:
+            assert False
         # poll process and mq
         poller = select.epoll()
         poller.register(mq.fd, select.EPOLLIN)
@@ -94,7 +117,7 @@ def trace_compiler_calls(env: spack.environment.Environment) -> List[str]:
 
 
         
-def proc_raw_messages(
+def _proc_raw_messages(
         specs_by_hash: Dict[str, Spec],
         messages: List[str]
 ) -> Dict[Spec, List[CompileCommand]]:
@@ -155,7 +178,7 @@ def concretize_tracing_wrapper(wrapper_cache_path: Optional[Path] ) -> Spec:
 def wrap_spec(
         spec_pair: spack.concretize.SpecPair,
         tracing_wrapper: Spec,
-        env: spack.environment.Environment
+        env: Optional[spack.environment.Environment]
 ) -> Spec:
     """
     Take an already concretized develop spec and replace it's 'compiler-wrapper'
@@ -179,21 +202,101 @@ def wrap_spec(
                 depflag=edge.depflag,
                 virtuals=edge.virtuals
             )
-    # Swap the patched spec into the environment
-    # See spack.environment.remove for the idea 
-    env_index = env.concretized_user_specs.index(user_spec)
-    user_spec = env.concretized_user_specs[env_index].copy()
-    del env.concretized_user_specs[env_index]
+    if env:
+        # Swap the patched spec into the environment
+        # See spack.environment.remove for the idea 
+        env_index = env.concretized_user_specs.index(user_spec)
+        user_spec = env.concretized_user_specs[env_index].copy()
+        del env.concretized_user_specs[env_index]
     
-    dag_hash = env.concretized_order[env_index]
-    del env.concretized_order[env_index]
-    del env.specs_by_hash[dag_hash]
-    env._add_concrete_spec(user_spec, wrapped_spec)
+        dag_hash = env.concretized_order[env_index]
+        del env.concretized_order[env_index]
+        del env.specs_by_hash[dag_hash]
+        env._add_concrete_spec(user_spec, wrapped_spec)
     return wrapped_spec
 
+
+def write_compile_commands(
+        raw_messages : List[str],
+        specs_by_hash : Dict[str, Spec],
+        spec_src_dirs : Dict[Spec, str]
+):
+    '''
+    Given a list of raw messages, extract the compile commands and write the
+    compile_commands.json to the source directory
+    '''
+    compile_commands_by_spec = _proc_raw_messages(specs_by_hash, raw_messages)
+    for spec, compile_commands in compile_commands_by_spec.items():
+        src_path = spec_src_dirs.get(spec, "")
+        output_json = Path(src_path) / "compile_commands.json" 
+        print(f"Logged commands for {spec.name} to {output_json}")
+        with open(output_json, "w") as f:
+            json.dump(compile_commands, f,indent=2)
+
+def trace_single_spec(user_spec: Spec, tracing_wrapper: Spec, source_root: str):
+    '''
+    Trace a single spec, storing its source-code at `source_root/NAME-HASH/spack-src`
+    '''
+    print(f"Concretizing: {user_spec}")
+    concrete_spec = spack.concretize.concretize_one(user_spec)
+    wrapped = wrap_spec((user_spec, concrete_spec), tracing_wrapper, None)
+    wrapped_package = wrapped.package
+    source_path = Path(source_root) / concrete_spec.format("{name}-{hash:7}")
+    wrapped_package.path = source_path.absolute()
+    raw_messages = trace_compiler_calls(package=wrapped_package)
+    specs_by_hash = {wrapped.dag_hash(): wrapped}
+    spec_src_dirs = {wrapped: source_path}
+    try:
+        write_compile_commands(raw_messages, specs_by_hash, spec_src_dirs)
+    finally:
+        with SuppressOutput(
+                msg_enabled=False,
+                warn_enabled=False,
+                error_enabled=False
+        ):
+            spack.package_base.PackageBase.uninstall_by_spec(wrapped, force=True)
+            spack.package_base.PackageBase.uninstall_by_spec(tracing_wrapper, force=True)
+
+def trace_env_dev_specs(env: spack.environment.Environment, tracing_wrapper: Spec):
+    '''
+    Trace the dev-specs in an environment
+    '''
+    with env.write_transaction():
+        env.concretize()
+        env.write()
+    wrapped_specs = [
+        wrap_spec(sp, tracing_wrapper, env)
+        for sp in env.concretized_specs()
+        if sp[1].is_develop
+    ]
+    specs_by_hash = env.specs_by_hash
+    raw_messages = trace_compiler_calls(env=env)
+    spec_src_dirs : Dict[Spec, str]= {
+        ws: str(ws.variants.get("dev_path").value) for ws in wrapped_specs
+    }
+    try:
+        write_compile_commands(raw_messages, specs_by_hash, spec_src_dirs)
+    except Exception as e:
+        print(e)
+    finally:
+        with SuppressOutput(
+                msg_enabled=False,
+                warn_enabled=False,
+                error_enabled=False
+        ):
+            for ws in wrapped_specs:
+                spack.package_base.PackageBase.uninstall_by_spec(ws, force=True)
+            spack.package_base.PackageBase.uninstall_by_spec(tracing_wrapper, force=True)
+    
 def setup_parser(parser: ArgumentParser):
-    arguments.add_common_arguments(parser, ["jobs", "concurrent_packages", "specs"])
+    arguments.add_common_arguments(parser, ["jobs", "concurrent_packages", "spec"])
     arguments.add_concretizer_args(parser)
+    parser.add_argument(
+        "--source-root",
+        type=str,
+        default=str(TRACE_ROOT / "sources"),
+        help="Where the source for single specs will be stored (defaults to spack-trace/sources)"
+    )
     parser.add_argument(
         "--cache-dir",
         type=str,
@@ -206,12 +309,11 @@ def setup_parser(parser: ArgumentParser):
         help="Do not cache anything related to this extension"
     )
 
-        
+    
 def trace(parser, args):
     '''
     The main command function
     '''
-    env = spack.cmd.require_active_env("trace")
     with spack.config.override("repos:trace_repo", str(TRACE_REPO)):
         if args.no_cache:
             cache_dir = None
@@ -219,39 +321,13 @@ def trace(parser, args):
             cache_dir = Path(args.cache_dir)
             cache_dir.mkdir(parents=True, exist_ok=True)
         tracing_wrapper = concretize_tracing_wrapper(cache_dir)
-        env = spack.cmd.require_active_env(cmd_name="trace")
-        if not env.dev_specs:
-            raise SpackError("spack trace requires at least one dev-spec to trace compiles")
-        with env.write_transaction():
-            env.concretize()
-            env.write()
-        wrapped_specs = [
-            wrap_spec(sp, tracing_wrapper, env)
-            for sp in env.concretized_specs()
-            if sp[1].is_develop
-        ]
-        specs_by_hash = env.specs_by_hash
-        raw_messages = trace_compiler_calls(env)
-        spec_src_dirs : Dict[Spec, str]= {
-            ws: str(ws.variants.get("dev_path").value) for ws in wrapped_specs
-        }
-        try:
-            compile_commands_by_spec = proc_raw_messages(specs_by_hash, raw_messages)
-            for spec, compile_commands in compile_commands_by_spec.items():
-                src_path = spec_src_dirs.get(spec, "")
-                output_json = Path(src_path) / "compile_commands.json" 
-                print(f"Logged commands for {spec.name} to {output_json}")
-                with open(output_json, "w") as f:
-                    json.dump(compile_commands, f,indent=2)
-        except Exception as e:
-            print(e)
-        finally:
-            with SuppressOutput(
-                    msg_enabled=False,
-                    warn_enabled=False,
-                    error_enabled=False
-            ):
-                for ws in wrapped_specs:
-                    spack.package_base.PackageBase.uninstall_by_spec(ws, force=True)
-                spack.package_base.PackageBase.uninstall_by_spec(tracing_wrapper, force=True)
+        if args.spec:
+            specs = parse_specs(args.spec)
+            user_spec = specs[0]
+            trace_single_spec(user_spec, tracing_wrapper, args.source_root)
+        else:
+            env = spack.cmd.require_active_env(cmd_name="trace")
+            if not env.dev_specs:
+                raise SpackError("spack trace requires at least one dev-spec to trace compiles")
+            trace_env_dev_specs(env, tracing_wrapper)
     
