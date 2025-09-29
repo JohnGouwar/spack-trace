@@ -71,7 +71,7 @@ def _single_installer_proc(package: spack.package_base.PackageBase):
         mq.close()
             
 
-def trace_compiler_calls(
+def _trace_compiler_calls(
     *,
     package: Optional[spack.package_base.PackageBase]=None,
     env: Optional[spack.environment.Environment]=None
@@ -175,7 +175,7 @@ def concretize_tracing_wrapper(wrapper_cache_path: Optional[Path] ) -> Spec:
     return tracing_wrapper
     
 
-def wrap_spec(
+def _wrap_spec(
         spec_pair: spack.concretize.SpecPair,
         tracing_wrapper: Spec,
         env: Optional[spack.environment.Environment]
@@ -216,10 +216,10 @@ def wrap_spec(
     return wrapped_spec
 
 
-def write_compile_commands(
+def _write_compile_commands(
         raw_messages : List[str],
         specs_by_hash : Dict[str, Spec],
-        spec_src_dirs : Dict[Spec, str]
+        spec_ccjson_paths : Dict[Spec, str]
 ):
     '''
     Given a list of raw messages, extract the compile commands and write the
@@ -227,35 +227,70 @@ def write_compile_commands(
     '''
     compile_commands_by_spec = _proc_raw_messages(specs_by_hash, raw_messages)
     for spec, compile_commands in compile_commands_by_spec.items():
-        src_path = spec_src_dirs.get(spec, "")
-        output_json = Path(src_path) / "compile_commands.json" 
+        output_json = spec_ccjson_paths.get(spec, "")
         print(f"Logged commands for {spec.name} to {output_json}")
         with open(output_json, "w") as f:
             json.dump(compile_commands, f,indent=2)
 
-def trace_single_spec(user_spec: Spec, tracing_wrapper: Spec, source_root: str):
+def trace_cli_specs(specs: List[Spec], tracing_wrapper: Spec, source_root: str):
     '''
     Trace a single spec, storing its source-code at `source_root/NAME-HASH/spack-src`
     '''
-    print(f"Concretizing: {user_spec}")
-    concrete_spec = spack.concretize.concretize_one(user_spec)
-    wrapped = wrap_spec((user_spec, concrete_spec), tracing_wrapper, None)
-    wrapped_package = wrapped.package
-    source_path = Path(source_root) / concrete_spec.format("{name}-{hash:7}")
-    wrapped_package.path = source_path.absolute()
-    raw_messages = trace_compiler_calls(package=wrapped_package)
-    specs_by_hash = {wrapped.dag_hash(): wrapped}
-    spec_src_dirs = {wrapped: source_path}
-    try:
-        write_compile_commands(raw_messages, specs_by_hash, spec_src_dirs)
-    finally:
-        with SuppressOutput(
-                msg_enabled=False,
-                warn_enabled=False,
-                error_enabled=False
-        ):
-            spack.package_base.PackageBase.uninstall_by_spec(wrapped, force=True)
-            spack.package_base.PackageBase.uninstall_by_spec(tracing_wrapper, force=True)
+    # spec.name accesses in a .format ensures that it always returns str
+    def _get_source_path(spec: Spec) -> Path:
+        return Path(source_root) / spec.format("{name}")
+    def _get_spec_json_path(spec: Spec) -> Path:
+        return _get_source_path(spec) / "trace_spec.json"
+    def _get_compile_commands_path(spec: Spec) -> Path:
+        return _get_source_path(spec) / "compile_commands.json"
+    to_concretize = []
+    for spec in specs:
+        spec_json_path =_get_spec_json_path(spec) 
+        if spec_json_path.exists():
+            with open(spec_json_path, "r") as f:
+            # Already concretized
+                concretized_spec = Spec.from_json(f)
+            to_concretize.append((spec, concretized_spec))
+        else:
+            to_concretize.append((spec, None))
+    if len(to_concretize) == 1:
+        user_spec, pot_concr = to_concretize[0]
+        if pot_concr:
+            concretized = [(user_spec, pot_concr)]
+        else:
+            concretized = [(user_spec, spack.concretize.concretize_one(user_spec))]
+    else:
+        concretized = spack.concretize.concretize_together_when_possible(to_concretize)
+    for (user_spec, concrete_spec) in concretized:
+        compile_commands_path = _get_compile_commands_path(concrete_spec)
+        if compile_commands_path.exists():
+            # We've already traced this spec, safe to skip
+            print(
+                f"Skipping {user_spec.name}, commands already traced at: {compile_commands_path}"
+            )
+            continue
+        wrapped = _wrap_spec((user_spec, concrete_spec), tracing_wrapper, None)
+        wrapped_package = wrapped.package
+        source_path = _get_source_path(concrete_spec).absolute()
+        wrapped_package.path = source_path
+        try:
+            raw_messages = _trace_compiler_calls(package=wrapped_package)
+        except KeyboardInterrupt:
+            exit(1)
+        except:
+            continue
+        specs_by_hash = {wrapped.dag_hash(): wrapped}
+        spec_ccjson_paths = {wrapped: str(_get_compile_commands_path(concrete_spec))}
+        try:
+            _write_compile_commands(raw_messages, specs_by_hash, spec_ccjson_paths)
+        finally:
+            with SuppressOutput(
+                    msg_enabled=False,
+                    warn_enabled=False,
+                    error_enabled=False
+            ):
+                spack.package_base.PackageBase.uninstall_by_spec(wrapped, force=True)
+                spack.package_base.PackageBase.uninstall_by_spec(tracing_wrapper, force=True)
 
 def trace_env_dev_specs(env: spack.environment.Environment, tracing_wrapper: Spec):
     '''
@@ -265,17 +300,18 @@ def trace_env_dev_specs(env: spack.environment.Environment, tracing_wrapper: Spe
         env.concretize()
         env.write()
     wrapped_specs = [
-        wrap_spec(sp, tracing_wrapper, env)
+        _wrap_spec(sp, tracing_wrapper, env)
         for sp in env.concretized_specs()
         if sp[1].is_develop
     ]
     specs_by_hash = env.specs_by_hash
-    raw_messages = trace_compiler_calls(env=env)
-    spec_src_dirs : Dict[Spec, str]= {
-        ws: str(ws.variants.get("dev_path").value) for ws in wrapped_specs
+    raw_messages = _trace_compiler_calls(env=env)
+    spec_ccjson_paths : Dict[Spec, str]= {
+        ws: str(ws.variants.get("dev_path").value / "compile_commands.json")
+        for ws in wrapped_specs
     }
     try:
-        write_compile_commands(raw_messages, specs_by_hash, spec_src_dirs)
+        _write_compile_commands(raw_messages, specs_by_hash, spec_ccjson_paths)
     except Exception as e:
         print(e)
     finally:
@@ -289,19 +325,21 @@ def trace_env_dev_specs(env: spack.environment.Environment, tracing_wrapper: Spe
             spack.package_base.PackageBase.uninstall_by_spec(tracing_wrapper, force=True)
     
 def setup_parser(parser: ArgumentParser):
-    arguments.add_common_arguments(parser, ["jobs", "concurrent_packages", "spec"])
+    arguments.add_common_arguments(parser, ["jobs", "concurrent_packages", "specs"])
     arguments.add_concretizer_args(parser)
     parser.add_argument(
         "--source-root",
         type=str,
         default=str(TRACE_ROOT / "sources"),
-        help="Where the source for single specs will be stored (defaults to spack-trace/sources)"
+        help="Where the source for single specs will be stored"
+        " (defaults to spack-trace/sources)"
     )
     parser.add_argument(
         "--cache-dir",
         type=str,
         default=str(TRACE_ROOT / ".trace-cache"),
-        help="Where to store cached_output for this extension (defaults to spack-trace/.trace-cache)\n"
+        help="Where to store cached_output for this extension"
+        " (defaults to spack-trace/.trace-cache)"
     )
     parser.add_argument(
         "--no-cache",
@@ -321,10 +359,9 @@ def trace(parser, args):
             cache_dir = Path(args.cache_dir)
             cache_dir.mkdir(parents=True, exist_ok=True)
         tracing_wrapper = concretize_tracing_wrapper(cache_dir)
-        if args.spec:
-            specs = parse_specs(args.spec)
-            user_spec = specs[0]
-            trace_single_spec(user_spec, tracing_wrapper, args.source_root)
+        if args.specs:
+            specs = parse_specs(args.specs)
+            trace_cli_specs(specs, tracing_wrapper, args.source_root)
         else:
             env = spack.cmd.require_active_env(cmd_name="trace")
             if not env.dev_specs:
