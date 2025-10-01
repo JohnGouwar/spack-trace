@@ -81,7 +81,8 @@ def _best_effort_concretize(
       for i, abstract in enumerate(to_concretize)
       if abstract.name not in successes and abstract.name not in fails
     ]
-
+    if len(args) == 0:
+        return
     # Ensure all bootstrapping is done before forking
     try:
         importlib.import_module("clingo")
@@ -93,6 +94,7 @@ def _best_effort_concretize(
     _ = spack.repo.PATH.provider_index
     _ = spack.compilers.config.all_compilers()
     num_procs = min(len(args), spack.config.determine_number_of_jobs(parallel=True))
+    
     try:
         for j, (i, concrete) in enumerate(
                 spack.util.parallel.imap_unordered(
