@@ -269,6 +269,7 @@ def trace_cli_specs(specs: List[Spec], tracing_wrapper: Spec, source_root: str):
                 f"Skipping {user_spec.name}, commands already traced at: {compile_commands_path}"
             )
             continue
+        Path(_get_spec_json_path(user_spec)).parent.mkdir(parents=True, exist_ok=True)
         with open(_get_spec_json_path(user_spec), "w") as f:
             concrete_spec.to_json(f)
         wrapped = _wrap_spec((user_spec, concrete_spec), tracing_wrapper, None)
