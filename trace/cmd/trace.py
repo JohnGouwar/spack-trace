@@ -17,11 +17,8 @@ from spack.cmd import parse_specs
 from multiprocessing import Process
 import select
 from spack.llnl.util.tty import SuppressOutput
-from typing import List, Dict, TypedDict, Optional
-try:
-    from spack.extensions.trace.PosixMQ import PosixMQ
-except:
-    from PosixMQ import PosixMQ
+from typing import List, Dict, Literal, TypedDict, Optional
+from PosixMQ import PosixMQ
 COMPILE_COMMANDS_MQ="/spacktracecc"
 TRACE_ROOT = Path(__file__).parent.parent.parent
 TRACE_REPO = TRACE_ROOT / "spack_repo" / "trace_repo"
@@ -117,9 +114,9 @@ def _trace_compiler_calls(
 
 
         
-def _proc_raw_messages(
+def _compile_commands_from_raw_messages(
         specs_by_hash: Dict[str, Spec],
-        messages: List[str]
+        messages: List[str],
 ) -> Dict[Spec, List[CompileCommand]]:
     '''
     Given the raw traced messages, separate them by their associated spec and
@@ -150,6 +147,18 @@ def _proc_raw_messages(
         compile_commands[specs_by_hash[hash]].append(comp_cmd)
     return compile_commands
 
+def _proc_all_raw_messages(specs_by_hash, messages):
+    output = defaultdict(list)
+    for msg in messages:
+        hash, wd, cmd, mode = msg.split(":")
+        output[specs_by_hash[hash]].append({
+            "working_dir": wd,
+            "cmd": cmd.split("\x07"),
+            "mode": mode
+        })
+    return output
+    
+
 
 def concretize_tracing_wrapper(wrapper_cache_path: Optional[Path] ) -> Spec:
     '''
@@ -174,6 +183,7 @@ def concretize_tracing_wrapper(wrapper_cache_path: Optional[Path] ) -> Spec:
             tracing_wrapper.to_json(f)
     return tracing_wrapper
     
+
 
 def _wrap_spec(
         spec_pair: spack.concretize.SpecPair,
@@ -219,33 +229,34 @@ def _wrap_spec(
 def _write_compile_commands(
         raw_messages : List[str],
         specs_by_hash : Dict[str, Spec],
-        spec_ccjson_paths : Dict[Spec, str]
+        spec_ccjson_paths : Dict[Spec, str],
+        mode : Literal["compile_commands"] | Literal["log"]
 ):
     '''
     Given a list of raw messages, extract the compile commands and write the
     compile_commands.json to the source directory
     '''
-    compile_commands_by_spec = _proc_raw_messages(specs_by_hash, raw_messages)
+    if mode == "compile_commands":
+        compile_commands_by_spec = _compile_commands_from_raw_messages(specs_by_hash, raw_messages)
+    elif mode == "log":
+        compile_commands_by_spec = _proc_all_raw_messages(specs_by_hash, raw_messages)
+    else:
+        raise Exception(f"Unrecognized mode: {mode}")
     for spec, compile_commands in compile_commands_by_spec.items():
         output_json = spec_ccjson_paths.get(spec, "")
         print(f"Logged commands for {spec.name} to {output_json}")
         with open(output_json, "w") as f:
             json.dump(compile_commands, f,indent=2)
+            
+def _get_source_path(spec: Spec, source_root) -> Path:
+    return Path(source_root) / spec.format("{name}")
+def _get_spec_json_path(spec: Spec, source_root: str) -> Path:
+    return _get_source_path(spec, source_root) / "trace_spec.json"
 
-def trace_cli_specs(specs: List[Spec], tracing_wrapper: Spec, source_root: str):
-    '''
-    Trace a single spec, storing its source-code at `source_root/NAME-HASH/spack-src`
-    '''
-    # spec.name accesses in a .format ensures that it always returns str
-    def _get_source_path(spec: Spec) -> Path:
-        return Path(source_root) / spec.format("{name}")
-    def _get_spec_json_path(spec: Spec) -> Path:
-        return _get_source_path(spec) / "trace_spec.json"
-    def _get_compile_commands_path(spec: Spec) -> Path:
-        return _get_source_path(spec) / "compile_commands.json"
+def _concretize_cli_specs(specs, source_root):
     to_concretize = []
     for spec in specs:
-        spec_json_path =_get_spec_json_path(spec) 
+        spec_json_path =_get_spec_json_path(spec, source_root) 
         if spec_json_path.exists():
             with open(spec_json_path, "r") as f:
             # Already concretized
@@ -261,6 +272,24 @@ def trace_cli_specs(specs: List[Spec], tracing_wrapper: Spec, source_root: str):
             concretized = [(user_spec, spack.concretize.concretize_one(user_spec))]
     else:
         concretized = spack.concretize.concretize_together_when_possible(to_concretize)
+    return concretized
+
+def trace_cli_specs(
+        specs: List[Spec],
+        tracing_wrapper: Spec,
+        source_root: str,
+        mode: Literal["compile_commands"] | Literal["log"]
+):
+    '''
+    Trace a single spec, storing its source-code at `source_root/NAME-HASH/spack-src`
+    '''
+    # spec.name accesses in a .format ensures that it always returns str
+    def _get_compile_commands_path(spec: Spec) -> Path:
+        if mode == "compile_commands":
+            return _get_source_path(spec, source_root) / "compile_commands.json"
+        elif mode == "log":
+            return _get_source_path(spec, source_root) / "compile_log.json"
+    concretized = _concretize_cli_specs(specs, source_root)
     for (user_spec, concrete_spec) in concretized:
         compile_commands_path = _get_compile_commands_path(concrete_spec)
         if compile_commands_path.exists():
@@ -269,12 +298,12 @@ def trace_cli_specs(specs: List[Spec], tracing_wrapper: Spec, source_root: str):
                 f"Skipping {user_spec.name}, commands already traced at: {compile_commands_path}"
             )
             continue
-        Path(_get_spec_json_path(user_spec)).parent.mkdir(parents=True, exist_ok=True)
-        with open(_get_spec_json_path(user_spec), "w") as f:
+        Path(_get_spec_json_path(user_spec, source_root)).parent.mkdir(parents=True, exist_ok=True)
+        with open(_get_spec_json_path(user_spec, source_root), "w") as f:
             concrete_spec.to_json(f)
         wrapped = _wrap_spec((user_spec, concrete_spec), tracing_wrapper, None)
         wrapped_package = wrapped.package
-        source_path = _get_source_path(concrete_spec).absolute()
+        source_path = _get_source_path(concrete_spec, source_root).absolute()
         wrapped_package.path = source_path
         try:
             raw_messages = _trace_compiler_calls(package=wrapped_package)
@@ -285,7 +314,7 @@ def trace_cli_specs(specs: List[Spec], tracing_wrapper: Spec, source_root: str):
         specs_by_hash = {wrapped.dag_hash(): wrapped}
         spec_ccjson_paths = {wrapped: str(_get_compile_commands_path(concrete_spec))}
         try:
-            _write_compile_commands(raw_messages, specs_by_hash, spec_ccjson_paths)
+            _write_compile_commands(raw_messages, specs_by_hash, spec_ccjson_paths, mode)
         finally:
             with SuppressOutput(
                     msg_enabled=False,
@@ -295,7 +324,7 @@ def trace_cli_specs(specs: List[Spec], tracing_wrapper: Spec, source_root: str):
                 spack.package_base.PackageBase.uninstall_by_spec(wrapped, force=True)
                 spack.package_base.PackageBase.uninstall_by_spec(tracing_wrapper, force=True)
 
-def trace_env_dev_specs(env: spack.environment.Environment, tracing_wrapper: Spec):
+def trace_env_dev_specs(env: spack.environment.Environment, tracing_wrapper: Spec, mode):
     '''
     Trace the dev-specs in an environment
     '''
@@ -314,7 +343,7 @@ def trace_env_dev_specs(env: spack.environment.Environment, tracing_wrapper: Spe
         for ws in wrapped_specs
     }
     try:
-        _write_compile_commands(raw_messages, specs_by_hash, spec_ccjson_paths)
+        _write_compile_commands(raw_messages, specs_by_hash, spec_ccjson_paths, mode)
     except Exception as e:
         print(e)
     finally:
@@ -349,25 +378,30 @@ def setup_parser(parser: ArgumentParser):
         action="store_true",
         help="Do not cache anything related to this extension"
     )
+    parser.add_argument(
+        "--mode",
+        choices=["compile_commands", "log"],
+        default="compile_commands",
+        help="compile_commands generates a compile_commands.json "
+        "log generates a json log of all commands traced by the wrapper"
+    )
 
-    
 def trace(parser, args):
     '''
     The main command function
     '''
-    with spack.config.override("repos:trace_repo", str(TRACE_REPO)):
-        if args.no_cache:
-            cache_dir = None
-        else:
-            cache_dir = Path(args.cache_dir)
-            cache_dir.mkdir(parents=True, exist_ok=True)
-        tracing_wrapper = concretize_tracing_wrapper(cache_dir)
-        if args.specs:
-            specs = parse_specs(args.specs)
-            trace_cli_specs(specs, tracing_wrapper, args.source_root)
-        else:
-            env = spack.cmd.require_active_env(cmd_name="trace")
-            if not env.dev_specs:
-                raise SpackError("spack trace requires at least one dev-spec to trace compiles")
-            trace_env_dev_specs(env, tracing_wrapper)
+    if args.no_cache:
+        cache_dir = None
+    else:
+        cache_dir = Path(args.cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    tracing_wrapper = concretize_tracing_wrapper(cache_dir)
+    if args.specs:
+        specs = parse_specs(args.specs)
+        trace_cli_specs(specs, tracing_wrapper, args.source_root, args.mode)
+    else:
+        env = spack.cmd.require_active_env(cmd_name="trace")
+        if not env.dev_specs:
+            raise SpackError("spack trace requires at least one dev-spec to trace compiles")
+        trace_env_dev_specs(env, tracing_wrapper, args.mode)
     

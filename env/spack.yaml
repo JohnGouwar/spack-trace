@@ -1,0 +1,20 @@
+spack:
+  config:
+    extensions:
+      - ../
+  packages:
+    gcc:
+      buildable: false
+  specs:
+  - 'python@3.12:'
+  - 'gcc@11:'
+  - py-pip
+  - py-posixmq
+  view: true
+  concretizer:
+    unify: true
+  env_vars:
+    set:
+      SPACK_PYTHON: $env/.spack-env/view/bin/python3
+  repos:
+    extensions: /home/jgouwar/git/llnl/spack-extension-packages/spack_repo/extensions

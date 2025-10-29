@@ -15,7 +15,11 @@ wheels/
 
 # Tracing cache
 .trace-cache
+sources
 
 # Pyright
 pyrightconfig.json
 
+# Spack env
+.spack-env
+spack.lock
