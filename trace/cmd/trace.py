@@ -200,6 +200,11 @@ def _wrap_spec(
     wrapped_spec = old_concr_spec.copy(deps=False)
     wrapped_spec.clear_caches(ignore=("package_hash",))
     for edge in old_concr_spec.edges_to_dependencies():
+        # Ensure that tracing_wrapper has the name "compiler-wrapper" but points
+        # to its actual package
+        p = tracing_wrapper.package
+        tracing_wrapper.name = "compiler-wrapper"
+        tracing_wrapper._package = p
         if edge.spec.name == "compiler-wrapper":
             wrapped_spec.add_dependency_edge(
                 tracing_wrapper,
