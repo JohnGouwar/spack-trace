@@ -3,28 +3,11 @@ spack:
     extensions:
     - ../
   specs:
-  - python@3.12
-  - 'gcc@11:'
-  - clingo@spack
-  - py-pip
-  - py-posixmq
+  - python@3.13
+  - tracecc-gcc@15.2.0 ^gcc  
+  - py-epic-ipc
   view: true
   concretizer:
     unify: true
-  env_vars:
-    set:
-      SPACK_PYTHON: $env/.spack-env/view/bin/python3
   repos:
-    extensions:
-      git: https://github.com/JohnGouwar/spack-extension-packages.git
-  bootstrap:
-    enable: true
-    root: $user_cache_path/bootstrap
-    sources:
-    - name: github-actions-v0.6
-      metadata: $spack/share/spack/bootstrap/github-actions-v0.6
-    - name: spack-install
-      metadata: $spack/share/spack/bootstrap/spack-install
-    trusted:
-      github-actions-v0.6: true
-      spack-install: true
+    extensions: /home/jgouwar/git/llnl/spack-extension-packages/spack_repo/extensions
