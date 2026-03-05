@@ -88,16 +88,21 @@ def setup_parser(parser: ArgumentParser):
     arguments.add_concretizer_args(parser)
     parser.add_argument(
         "--source-root",
-        type=str,
+        type=Path,
         default=str(TRACE_ROOT / "sources"),
         help="Where the source for single specs will be stored"
         " (defaults to spack-trace/sources)"
+    )
+    parser.add_argument(
+        "--spec-file",
+        type=Path,
+        help="Newline separated file of abstract specs"
     )
 
 def ensure_tracecc(installer):
     tracecc_spec = spack.store.STORE.db.query_one("tracecc-gcc ^gcc", installed=True)
     if tracecc_spec is not None:
-        tty.info(f"Already installed {tracecc_spec.format('{hame}/{hash:7}')}")
+        tty.info(f"Already installed {tracecc_spec.format('{name}/{hash:7}')}")
         return
     else:
         tty.info("Installing tracecc-gcc")
@@ -105,7 +110,7 @@ def ensure_tracecc(installer):
         installer([tracecc_spec.package]).install()
 
         
-def concretize_with_tracecc(specs: list[Spec], source_root: Path, installer):
+def concretize_with_tracecc(specs: list[Spec], installer):
     ensure_tracecc(installer)
     for s in specs:
         s.add_dependency_edge(Spec("tracecc-gcc"), depflag=dt.BUILD, virtuals=("c",), when=Spec("%c"))
@@ -123,13 +128,18 @@ def trace(parser, args):
         from spack.new_installer import PackageInstaller
     else:
         from spack.installer import PackageInstaller
-    specs = parse_specs(args.specs)
-    assert len(specs) > 0, "Must provide at least one spec"
+    if args.specs:
+        specs = parse_specs(args.specs)
+    elif args.spec_file is not None and args.spec_file.exists():
+        with open(args.spec_file, "r") as f:
+            specs = [Spec(l) for l in f]
+    else:
+        raise Exception("Must provide cli specs or existing spec file")
     packages = []
     hash_to_output_file = {}
-    for _, concr in concretize_with_tracecc(specs, args.source_root, PackageInstaller):
+    for _, concr in concretize_with_tracecc(specs, PackageInstaller):
         package = concr.package
-        package.path = (Path(args.source_root) / concr.format("{name}")).absolute()
+        package.path = (args.source_root / concr.format("{name}")).absolute()
         packages.append(package)
         hash_to_output_file[concr.dag_hash()] = package.path / "compile_log.json"
     msg_recv, msg_send = Pipe(duplex=False)
